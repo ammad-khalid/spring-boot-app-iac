@@ -1,0 +1,107 @@
+name: create infra 
+
+on: 
+ workflow_dispatch:
+    inputs:
+      TFaction:
+        description: 'Choose what action to be done'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+      TFdeploy:
+        description: 'Choose which AWS service to be deployed'
+        required: true
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - Infra_deployment
+jobs:
+#Infra Deployment
+  Infra_deployment:
+    name: "Deploying Dev infrastructure"
+    runs-on: ubuntu-latest
+    env:
+      ## AWS Parameters
+      AWS_DEFAULT_REGION: 'us-east-1'
+      SSM_PARAMETER: 'TF_OUTPUT_DEV'
+      SSM_PARAMETER_DESC: 'AWS Terraform output paramaters'
+    permissions:
+      id-token: write # This is required for requesting the JWT
+      contents: read  # This is required for actions/checkout
+    defaults:
+      run:
+        working-directory: environments/dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.DEV_AWS_ROLE_ARN }}
+          role-session-name: assume-role-github-integration
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.4.5
+
+      - name: Terraform Init
+        id: init
+        if: ${{ github.event.inputs.TFaction == 'apply' || github.event.inputs.TFaction == 'plan' || github.event.inputs.TFaction == 'destroy' }}        
+        run: terraform init -reconfigure
+
+      - name: Terraform Validate
+        id: validate
+        if: ${{ github.event.inputs.TFaction == 'apply' || github.event.inputs.TFaction == 'plan' }}
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        if: ${{ github.event.inputs.TFaction == 'apply' || github.event.inputs.TFaction == 'plan' }}
+        run: terraform plan --var-file=terraform.tfvars -auto-approve
+
+      - name: Terraform Apply
+        id: apply
+        if: ${{ github.event.inputs.TFaction == 'apply' }}
+        run: terraform apply --var-file=terraform.tfvars -auto-approve
+        
+      - name: Terraform Destroy
+        id: destroy
+        if: ${{ github.event.inputs.TFaction == 'destroy' }}
+        run: terraform destroy --var-file=dev.tfvars -auto-approve
+
+      - name: Terraform Output Retreval
+        if: ${{ github.event.inputs.TFaction == 'apply' }}
+        run: |
+          echo "TF_OUTPUT=$(terraform-bin output -no-color -json | jq -rc)" >> $GITHUB_ENV
+        id: tfoutput
+
+      - name: Output SSM update
+        id: ssm-update
+        if: ${{ github.event.inputs.TFaction == 'apply' }}
+        run: |
+          set +e
+          STATUS=`aws ssm get-parameter --name "${{ env.SSM_PARAMETER }}" &>/dev/null && echo $?`
+          if [[ -z ${STATUS} ]]; then
+            aws ssm put-parameter \
+              --name "${{ env.SSM_PARAMETER }}" \
+              --type "String" \
+              --value '${{ env.TF_OUTPUT }}' \
+              --description "${{ env.SSM_PARAMETER_DESC }}" \
+              --tags '[{"Key":"terraform","Value":"true"},{"Key":"group","Value":"devops"},{"Key":"repo","Value":"infrastructure"}]'
+          else
+            aws ssm put-parameter \
+              --name "${{ env.SSM_PARAMETER }}" \
+              --type "String" \
+              --value '${{ env.TF_OUTPUT }}' \
+              --description "${{ env.SSM_PARAMETER_DESC }}" \
+              --overwrite
+          fi
